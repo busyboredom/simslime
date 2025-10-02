@@ -17,10 +17,12 @@ use bevy::{
         render_asset::{RenderAssetUsages, RenderAssets},
         render_graph::{self, RenderGraph, RenderLabel},
         render_resource::{
-            BindGroup, BindGroupEntries, BindGroupLayout, BindGroupLayoutEntries,
-            CachedComputePipelineId, CachedPipelineState, ComputePassDescriptor,
-            ComputePipelineDescriptor, Extent3d, PipelineCache, ShaderStages, StorageTextureAccess,
-            TextureDimension, TextureFormat, TextureUsages, binding_types::texture_storage_2d,
+            BindGroup, BindGroupEntries, BindGroupLayout, BindGroupLayoutEntries, Buffer,
+            BufferInitDescriptor, BufferUsages, CachedComputePipelineId, CachedPipelineState,
+            ComputePassDescriptor, ComputePipelineDescriptor, Extent3d, PipelineCache,
+            ShaderStages, ShaderType, StorageTextureAccess, TextureDimension, TextureFormat,
+            TextureUsages,
+            binding_types::{storage_buffer, storage_buffer_read_only, texture_storage_2d},
         },
         renderer::{RenderContext, RenderDevice},
         texture::GpuImage,
@@ -31,9 +33,14 @@ use std::borrow::Cow;
 /// This example uses a shader source file from the assets subdirectory
 const SHADER_ASSET_PATH: &str = "shaders.wgsl";
 
-const DISPLAY_FACTOR: u32 = 4;
-const SIZE: (u32, u32) = (1280 / DISPLAY_FACTOR, 720 / DISPLAY_FACTOR);
+const DISPLAY_FACTOR: u32 = 1;
+const SIZE: (u32, u32) = (1500 / DISPLAY_FACTOR, 1000 / DISPLAY_FACTOR);
 const WORKGROUP_SIZE: u32 = 8;
+
+#[derive(ShaderType, Clone)]
+struct CountBuffer {
+    count: u32,
+}
 
 fn main() {
     App::new()
@@ -137,7 +144,14 @@ struct GameOfLifeImages {
 }
 
 #[derive(Resource)]
-struct GameOfLifeImageBindGroups([BindGroup; 2]);
+struct GameOfLifeBindGroups {
+    // Ping-pong bind groups for the main simulation pass
+    sim_group_a: BindGroup,
+    sim_group_b: BindGroup,
+    // Ping-pong bind groups for the counting pass
+    count_group_a: BindGroup,
+    count_group_b: BindGroup,
+}
 
 fn prepare_bind_group(
     mut commands: Commands,
@@ -148,24 +162,53 @@ fn prepare_bind_group(
 ) {
     let view_a = gpu_images.get(&game_of_life_images.texture_a).unwrap();
     let view_b = gpu_images.get(&game_of_life_images.texture_b).unwrap();
-    let bind_group_0 = render_device.create_bind_group(
+    let count_buffer_binding = pipeline.count_buffer.as_entire_binding();
+
+    let sim_group_a = render_device.create_bind_group(
         None,
         &pipeline.texture_bind_group_layout,
-        &BindGroupEntries::sequential((&view_a.texture_view, &view_b.texture_view)),
+        &BindGroupEntries::sequential((
+            &view_a.texture_view,
+            &view_b.texture_view,
+            count_buffer_binding.clone(),
+        )),
     );
-    let bind_group_1 = render_device.create_bind_group(
+    let sim_group_b = render_device.create_bind_group(
         None,
         &pipeline.texture_bind_group_layout,
-        &BindGroupEntries::sequential((&view_b.texture_view, &view_a.texture_view)),
+        &BindGroupEntries::sequential((
+            &view_b.texture_view,
+            &view_a.texture_view,
+            count_buffer_binding.clone(),
+        )),
     );
-    commands.insert_resource(GameOfLifeImageBindGroups([bind_group_0, bind_group_1]));
+    let count_group_a = render_device.create_bind_group(
+        "count_bind_group_a",
+        &pipeline.count_layout,
+        &BindGroupEntries::sequential((&view_a.texture_view, count_buffer_binding.clone())),
+    );
+    let count_group_b = render_device.create_bind_group(
+        "count_bind_group_b",
+        &pipeline.count_layout,
+        &BindGroupEntries::sequential((&view_b.texture_view, count_buffer_binding)),
+    );
+
+    commands.insert_resource(GameOfLifeBindGroups {
+        sim_group_a,
+        sim_group_b,
+        count_group_a,
+        count_group_b,
+    });
 }
 
 #[derive(Resource)]
 struct GameOfLifePipeline {
     texture_bind_group_layout: BindGroupLayout,
+    count_layout: BindGroupLayout,
+    count_buffer: Buffer,
     init_pipeline: CachedComputePipelineId,
     update_pipeline: CachedComputePipelineId,
+    count_pipeline: CachedComputePipelineId,
 }
 
 impl FromWorld for GameOfLifePipeline {
@@ -178,11 +221,31 @@ impl FromWorld for GameOfLifePipeline {
                 (
                     texture_storage_2d(TextureFormat::R32Float, StorageTextureAccess::ReadOnly),
                     texture_storage_2d(TextureFormat::R32Float, StorageTextureAccess::WriteOnly),
+                    storage_buffer_read_only::<CountBuffer>(false),
                 ),
             ),
         );
+
+        let count_layout = render_device.create_bind_group_layout(
+            "count_layout",
+            &BindGroupLayoutEntries::sequential(
+                ShaderStages::COMPUTE,
+                (
+                    texture_storage_2d(TextureFormat::R32Float, StorageTextureAccess::ReadOnly),
+                    storage_buffer::<CountBuffer>(false),
+                ),
+            ),
+        );
+
+        let count_buffer = render_device.create_buffer_with_data(&BufferInitDescriptor {
+            label: Some("count_buffer"),
+            contents: &0u32.to_ne_bytes(),
+            usage: BufferUsages::STORAGE | BufferUsages::COPY_DST | BufferUsages::COPY_SRC,
+        });
+
         let shader = world.load_asset(SHADER_ASSET_PATH);
         let pipeline_cache = world.resource::<PipelineCache>();
+
         let init_pipeline = pipeline_cache.queue_compute_pipeline(ComputePipelineDescriptor {
             label: None,
             layout: vec![texture_bind_group_layout.clone()],
@@ -196,16 +259,28 @@ impl FromWorld for GameOfLifePipeline {
             label: None,
             layout: vec![texture_bind_group_layout.clone()],
             push_constant_ranges: Vec::new(),
-            shader,
+            shader: shader.clone(),
             shader_defs: vec![],
             entry_point: Cow::from("update"),
+            zero_initialize_workgroup_memory: false,
+        });
+        let count_pipeline = pipeline_cache.queue_compute_pipeline(ComputePipelineDescriptor {
+            label: Some("count_pipeline".into()),
+            layout: vec![count_layout.clone()],
+            shader,
+            shader_defs: Vec::new(),
+            entry_point: "count_alive_pixels".into(),
+            push_constant_ranges: Vec::new(),
             zero_initialize_workgroup_memory: false,
         });
 
         GameOfLifePipeline {
             texture_bind_group_layout,
+            count_layout,
+            count_buffer,
             init_pipeline,
             update_pipeline,
+            count_pipeline,
         }
     }
 }
@@ -247,9 +322,10 @@ impl render_graph::Node for GameOfLifeNode {
                 }
             }
             GameOfLifeState::Init => {
-                if let CachedPipelineState::Ok(_) =
-                    pipeline_cache.get_compute_pipeline_state(pipeline.update_pipeline)
-                {
+                if let (CachedPipelineState::Ok(_), CachedPipelineState::Ok(_)) = (
+                    pipeline_cache.get_compute_pipeline_state(pipeline.update_pipeline),
+                    pipeline_cache.get_compute_pipeline_state(pipeline.count_pipeline),
+                ) {
                     self.state = GameOfLifeState::Update(1);
                 }
             }
@@ -269,32 +345,55 @@ impl render_graph::Node for GameOfLifeNode {
         render_context: &mut RenderContext,
         world: &World,
     ) -> Result<(), render_graph::NodeRunError> {
-        let bind_groups = &world.resource::<GameOfLifeImageBindGroups>().0;
+        let bind_groups = &world.resource::<GameOfLifeBindGroups>();
         let pipeline_cache = world.resource::<PipelineCache>();
         let pipeline = world.resource::<GameOfLifePipeline>();
 
-        let mut pass = render_context
-            .command_encoder()
-            .begin_compute_pass(&ComputePassDescriptor::default());
+        let command_encoder = render_context.command_encoder();
 
         // select the pipeline based on the current state
         match self.state {
             GameOfLifeState::Loading => {}
             GameOfLifeState::Init => {
+                let mut pass =
+                    command_encoder.begin_compute_pass(&ComputePassDescriptor::default());
                 let init_pipeline = pipeline_cache
                     .get_compute_pipeline(pipeline.init_pipeline)
                     .unwrap();
-                pass.set_bind_group(0, &bind_groups[0], &[]);
+                pass.set_bind_group(0, &bind_groups.sim_group_a, &[]);
                 pass.set_pipeline(init_pipeline);
                 pass.dispatch_workgroups(SIZE.0 / WORKGROUP_SIZE, SIZE.1 / WORKGROUP_SIZE, 1);
             }
             GameOfLifeState::Update(index) => {
+                let (sim_bind_group, count_bind_group) = if index == 0 {
+                    (&bind_groups.sim_group_a, &bind_groups.count_group_a)
+                } else {
+                    (&bind_groups.sim_group_b, &bind_groups.count_group_b)
+                };
+
+                let count_pipeline = pipeline_cache
+                    .get_compute_pipeline(pipeline.count_pipeline)
+                    .unwrap();
                 let update_pipeline = pipeline_cache
                     .get_compute_pipeline(pipeline.update_pipeline)
                     .unwrap();
-                pass.set_bind_group(0, &bind_groups[index], &[]);
-                pass.set_pipeline(update_pipeline);
-                pass.dispatch_workgroups(SIZE.0 / WORKGROUP_SIZE, SIZE.1 / WORKGROUP_SIZE, 1);
+
+                command_encoder.clear_buffer(&pipeline.count_buffer, 0, None);
+                {
+                    let mut pass =
+                        command_encoder.begin_compute_pass(&ComputePassDescriptor::default());
+                    pass.set_pipeline(count_pipeline);
+                    pass.set_bind_group(0, count_bind_group, &[]);
+                    pass.dispatch_workgroups(SIZE.0 / WORKGROUP_SIZE, SIZE.1 / WORKGROUP_SIZE, 1);
+                }
+
+                {
+                    let mut pass =
+                        command_encoder.begin_compute_pass(&ComputePassDescriptor::default());
+                    pass.set_bind_group(0, sim_bind_group, &[]);
+                    pass.set_pipeline(update_pipeline);
+                    pass.dispatch_workgroups(SIZE.0 / WORKGROUP_SIZE, SIZE.1 / WORKGROUP_SIZE, 1);
+                }
             }
         }
 

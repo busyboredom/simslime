@@ -4,9 +4,16 @@
 // Two textures are needed for the game of life as each pixel of step N depends on the state of its
 // neighbors at step N-1.
 
-@group(0) @binding(0) var input: texture_storage_2d<r32float, read>;
+struct CountBuffer {
+    count: atomic<u32>,
+}
 
+@group(0) @binding(0) var input: texture_storage_2d<r32float, read>;
 @group(0) @binding(1) var output: texture_storage_2d<r32float, write>;
+@group(0) @binding(2) var<storage, read> count_buffer_in: CountBuffer;
+
+@group(0) @binding(0) var texture_to_count: texture_storage_2d<r32float, read>;
+@group(0) @binding(1) var<storage, read_write> count_buffer_out: CountBuffer;
 
 fn hash(value: u32) -> u32 {
     var state = value;
@@ -65,7 +72,35 @@ fn update(@builtin(global_invocation_id) invocation_id: vec3<u32>) {
     } else {
         alive = false;
     }
+
+    let dims = textureDimensions(input);
+    let total_pixels = dims.x * dims.y;
+    let alive_count = atomicLoad(&count_buffer_in.count);
+
+    if (alive_count < (total_pixels / 10u)) {
+        if (!alive) {
+            let seed = (invocation_id.y << 16u | invocation_id.x) + u32(n_alive);
+            let randomNumber = randomFloat(seed);
+            if (randomNumber < 0.001) {
+                alive = true;
+            }
+        }
+    }
+
     let color = vec4<f32>(f32(alive));
 
     textureStore(output, location, color);
+}
+
+@compute @workgroup_size(8, 8, 1)
+fn count_alive_pixels(@builtin(global_invocation_id) invocation_id: vec3<u32>) {
+    let dims = textureDimensions(texture_to_count);
+    if (invocation_id.x >= dims.x || invocation_id.y >= dims.y) {
+        return;
+    }
+    let coords = vec2<i32>(invocation_id.xy);
+    let texel_value = textureLoad(texture_to_count, coords);
+    if (texel_value.r != 0.0) {
+        atomicAdd(&count_buffer_out.count, 1u);
+    }
 }
