@@ -5,6 +5,7 @@
 
 use bevy::{
     DefaultPlugins,
+    asset::RenderAssetUsages,
     prelude::{
         App, Assets, Camera2d, ClearColor, Color, Commands, DirectAssetAccessExt, FromWorld,
         Handle, Image, ImagePlugin, IntoScheduleConfigs, Plugin, PluginGroup, Res, ResMut,
@@ -12,9 +13,9 @@ use bevy::{
         World, default,
     },
     render::{
-        Render, RenderApp, RenderSet,
+        Render, RenderApp, RenderSystems,
         extract_resource::{ExtractResource, ExtractResourcePlugin},
-        render_asset::{RenderAssetUsages, RenderAssets},
+        render_asset::RenderAssets,
         render_graph::{self, RenderGraph, RenderLabel},
         render_resource::{
             BindGroup, BindGroupEntries, BindGroupLayout, BindGroupLayoutEntries, Buffer,
@@ -49,13 +50,9 @@ fn main() {
             DefaultPlugins
                 .set(WindowPlugin {
                     primary_window: Some(Window {
-                        resolution: (
-                            (SIZE.0 * DISPLAY_FACTOR) as f32,
-                            (SIZE.1 * DISPLAY_FACTOR) as f32,
-                        )
-                            .into(),
+                        resolution: ((SIZE.0 * DISPLAY_FACTOR), (SIZE.1 * DISPLAY_FACTOR)).into(),
                         // uncomment for unthrottled FPS
-                        // present_mode: bevy::window::PresentMode::AutoNoVsync,
+                        present_mode: bevy::window::PresentMode::AutoNoVsync,
                         ..default()
                     }),
                     ..default()
@@ -82,12 +79,13 @@ fn setup(mut commands: Commands, mut images: ResMut<Assets<Image>>) {
     );
     image.texture_descriptor.usage =
         TextureUsages::COPY_DST | TextureUsages::STORAGE_BINDING | TextureUsages::TEXTURE_BINDING;
-    let image0 = images.add(image.clone());
-    let image1 = images.add(image);
+    let image_a = images.add(image.clone());
+    let image_b = images.add(image);
 
+    #[expect(clippy::cast_precision_loss)]
     commands.spawn((
         Sprite {
-            image: image0.clone(),
+            image: image_a.clone(),
             custom_size: Some(Vec2::new(SIZE.0 as f32, SIZE.1 as f32)),
             ..default()
         },
@@ -96,17 +94,18 @@ fn setup(mut commands: Commands, mut images: ResMut<Assets<Image>>) {
     commands.spawn(Camera2d);
 
     commands.insert_resource(GameOfLifeImages {
-        texture_a: image0,
-        texture_b: image1,
+        texture_a: image_a,
+        texture_b: image_b,
     });
 }
 
 // Switch texture to display every frame to show the one that was written to most recently.
+#[expect(clippy::needless_pass_by_value)]
 fn switch_textures(images: Res<GameOfLifeImages>, mut sprite: Single<&mut Sprite>) {
     if sprite.image == images.texture_a {
-        sprite.image = images.texture_b.clone_weak();
+        sprite.image = images.texture_b.clone();
     } else {
-        sprite.image = images.texture_a.clone_weak();
+        sprite.image = images.texture_a.clone();
     }
 }
 
@@ -123,7 +122,7 @@ impl Plugin for GameOfLifeComputePlugin {
         let render_app = app.sub_app_mut(RenderApp);
         render_app.add_systems(
             Render,
-            prepare_bind_group.in_set(RenderSet::PrepareBindGroups),
+            prepare_bind_group.in_set(RenderSystems::PrepareBindGroups),
         );
 
         let mut render_graph = render_app.world_mut().resource_mut::<RenderGraph>();
@@ -153,6 +152,7 @@ struct GameOfLifeBindGroups {
     count_group_b: BindGroup,
 }
 
+#[expect(clippy::needless_pass_by_value)]
 fn prepare_bind_group(
     mut commands: Commands,
     pipeline: Res<GameOfLifePipeline>,
@@ -252,7 +252,7 @@ impl FromWorld for GameOfLifePipeline {
             push_constant_ranges: Vec::new(),
             shader: shader.clone(),
             shader_defs: vec![],
-            entry_point: Cow::from("init"),
+            entry_point: Some(Cow::from("init")),
             zero_initialize_workgroup_memory: false,
         });
         let update_pipeline = pipeline_cache.queue_compute_pipeline(ComputePipelineDescriptor {
@@ -261,7 +261,7 @@ impl FromWorld for GameOfLifePipeline {
             push_constant_ranges: Vec::new(),
             shader: shader.clone(),
             shader_defs: vec![],
-            entry_point: Cow::from("update"),
+            entry_point: Some(Cow::from("update")),
             zero_initialize_workgroup_memory: false,
         });
         let count_pipeline = pipeline_cache.queue_compute_pipeline(ComputePipelineDescriptor {
@@ -269,7 +269,7 @@ impl FromWorld for GameOfLifePipeline {
             layout: vec![count_layout.clone()],
             shader,
             shader_defs: Vec::new(),
-            entry_point: "count_alive_pixels".into(),
+            entry_point: Some(Cow::from("count_alive_pixels")),
             push_constant_ranges: Vec::new(),
             zero_initialize_workgroup_memory: false,
         });
