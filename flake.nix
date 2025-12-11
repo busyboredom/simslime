@@ -17,6 +17,7 @@
           rustup
           pkg-config
           rust-analyzer
+          lldb # Debugger
           typos-lsp
           wgsl-analyzer
           openssl # For cargo-outdated
@@ -47,6 +48,7 @@
                 alias test="cargo +nightly test --all-targets --all-features"
 
                 export LD_LIBRARY_PATH=${pkgs.lib.makeLibraryPath deps}
+                export PATH=$PATH:${pkgs.vscode-extensions.vadimcn.vscode-lldb}/share/vscode/extensions/vadimcn.vscode-lldb/adapter
               '';
             };
       }
