@@ -4,7 +4,10 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-bevy = "0.17.3"
+cubecl = { version = "0.8.1", features = ["wgpu"] }
+rerun = "0.28.1"
+tokio = { version = "1.48.0", features = ["rt-multi-thread", "macros"] }
+bytemuck = "1.24"
 
 [profile.release]
 lto = "fat"

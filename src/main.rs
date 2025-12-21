@@ -1,402 +1,264 @@
-//! A compute shader that simulates Conway's Game of Life.
-//!
-//! Compute shaders use the GPU for computing arbitrary information, that may be independent of what
-//! is rendered to the screen.
-
-use bevy::{
-    DefaultPlugins,
-    asset::RenderAssetUsages,
+use cubecl::{
+    CubeCount, CubeDim, Runtime, cube,
+    frontend::CompilationArg,
     prelude::{
-        App, Assets, Camera2d, ClearColor, Color, Commands, DirectAssetAccessExt, FromWorld,
-        Handle, Image, ImagePlugin, IntoScheduleConfigs, Plugin, PluginGroup, Res, ResMut,
-        Resource, Single, Sprite, Startup, Transform, Update, Vec2, Vec3, Window, WindowPlugin,
-        World, default,
+        ABSOLUTE_POS, Array, ArrayArg, Atomic, CUBE_DIM_X, CUBE_DIM_Y, CUBE_POS_X, CUBE_POS_Y,
+        SharedMemory, Tensor, TensorArg, UNIT_POS, UNIT_POS_X, UNIT_POS_Y, sync_cube,
     },
-    render::{
-        Render, RenderApp, RenderSystems,
-        extract_resource::{ExtractResource, ExtractResourcePlugin},
-        render_asset::RenderAssets,
-        render_graph::{self, RenderGraph, RenderLabel},
-        render_resource::{
-            BindGroup, BindGroupEntries, BindGroupLayout, BindGroupLayoutEntries, Buffer,
-            BufferInitDescriptor, BufferUsages, CachedComputePipelineId, CachedPipelineState,
-            ComputePassDescriptor, ComputePipelineDescriptor, Extent3d, PipelineCache,
-            ShaderStages, ShaderType, StorageTextureAccess, TextureDimension, TextureFormat,
-            TextureUsages,
-            binding_types::{storage_buffer, storage_buffer_read_only, texture_storage_2d},
-        },
-        renderer::{RenderContext, RenderDevice},
-        texture::GpuImage,
-    },
+    server::Allocation,
+    wgpu::WgpuRuntime,
 };
-use std::borrow::Cow;
+use rerun::external::arrow::datatypes::ToByteSlice;
 
-/// This example uses a shader source file from the assets subdirectory
-const SHADER_ASSET_PATH: &str = "shaders.wgsl";
+const WIDTH: usize = 1500;
+const HEIGHT: usize = 1000;
 
-const DISPLAY_FACTOR: u32 = 1;
-const SIZE: (u32, u32) = (1500 / DISPLAY_FACTOR, 1000 / DISPLAY_FACTOR);
-const WORKGROUP_SIZE: u32 = 8;
-
-#[derive(ShaderType, Clone)]
-struct CountBuffer {
-    count: u32,
+#[cube]
+fn hash(value: u32) -> u32 {
+    let mut state = value;
+    state = state ^ 2747636419u32;
+    state = state * 2654435769u32;
+    state = state ^ state >> 16u32;
+    state = state * 2654435769u32;
+    state = state ^ state >> 16u32;
+    state = state * 2654435769u32;
+    state
 }
 
-fn main() {
-    App::new()
-        .insert_resource(ClearColor(Color::BLACK))
-        .add_plugins((
-            DefaultPlugins
-                .set(WindowPlugin {
-                    primary_window: Some(Window {
-                        resolution: ((SIZE.0 * DISPLAY_FACTOR), (SIZE.1 * DISPLAY_FACTOR)).into(),
-                        // uncomment for unthrottled FPS
-                        present_mode: bevy::window::PresentMode::AutoNoVsync,
-                        ..default()
-                    }),
-                    ..default()
-                })
-                .set(ImagePlugin::default_nearest()),
-            GameOfLifeComputePlugin,
-        ))
-        .add_systems(Startup, setup)
-        .add_systems(Update, switch_textures)
-        .run();
+#[cube]
+fn random_float(value: u32) -> f32 {
+    // Convert integer hash to 0.0..1.0 float
+    hash(value) as f32 / 4294967295.0
 }
 
-fn setup(mut commands: Commands, mut images: ResMut<Assets<Image>>) {
-    let mut image = Image::new_fill(
-        Extent3d {
-            width: SIZE.0,
-            height: SIZE.1,
-            depth_or_array_layers: 1,
-        },
-        TextureDimension::D2,
-        &[0, 0, 0, 255],
-        TextureFormat::R32Float,
-        RenderAssetUsages::RENDER_WORLD,
-    );
-    image.texture_descriptor.usage =
-        TextureUsages::COPY_DST | TextureUsages::STORAGE_BINDING | TextureUsages::TEXTURE_BINDING;
-    let image_a = images.add(image.clone());
-    let image_b = images.add(image);
-
-    #[expect(clippy::cast_precision_loss)]
-    commands.spawn((
-        Sprite {
-            image: image_a.clone(),
-            custom_size: Some(Vec2::new(SIZE.0 as f32, SIZE.1 as f32)),
-            ..default()
-        },
-        Transform::from_scale(Vec3::splat(DISPLAY_FACTOR as f32)),
-    ));
-    commands.spawn(Camera2d);
-
-    commands.insert_resource(GameOfLifeImages {
-        texture_a: image_a,
-        texture_b: image_b,
-    });
-}
-
-// Switch texture to display every frame to show the one that was written to most recently.
-#[expect(clippy::needless_pass_by_value)]
-fn switch_textures(images: Res<GameOfLifeImages>, mut sprite: Single<&mut Sprite>) {
-    if sprite.image == images.texture_a {
-        sprite.image = images.texture_b.clone();
-    } else {
-        sprite.image = images.texture_a.clone();
+#[cube(launch)]
+fn count_reset_kernel(count_buffer: &mut Array<Atomic<u32>>) {
+    if ABSOLUTE_POS == 0 {
+        Atomic::store(&mut count_buffer[0], 0);
     }
 }
 
-struct GameOfLifeComputePlugin;
+#[cube(launch)]
+fn init_kernel(output: &mut Tensor<u32>) {
+    let width = output.shape(1);
+    let idx = ABSOLUTE_POS;
+    let x = idx % width;
+    let y = idx / width;
 
-#[derive(Debug, Hash, PartialEq, Eq, Clone, RenderLabel)]
-struct GameOfLifeLabel;
+    let seed = (y << 16) | x;
+    let val = random_float(seed);
 
-impl Plugin for GameOfLifeComputePlugin {
-    fn build(&self, app: &mut App) {
-        // Extract the game of life image resource from the main world into the render world
-        // for operation on by the compute shader and display on the sprite.
-        app.add_plugins(ExtractResourcePlugin::<GameOfLifeImages>::default());
-        let render_app = app.sub_app_mut(RenderApp);
-        render_app.add_systems(
-            Render,
-            prepare_bind_group.in_set(RenderSystems::PrepareBindGroups),
-        );
-
-        let mut render_graph = render_app.world_mut().resource_mut::<RenderGraph>();
-        render_graph.add_node(GameOfLifeLabel, GameOfLifeNode::default());
-        render_graph.add_node_edge(GameOfLifeLabel, bevy::render::graph::CameraDriverLabel);
-    }
-
-    fn finish(&self, app: &mut App) {
-        let render_app = app.sub_app_mut(RenderApp);
-        render_app.init_resource::<GameOfLifePipeline>();
-    }
+    // 10% chance to be alive
+    output[idx] = if val > 0.9 { 1u32.into() } else { 0u32.into() };
 }
 
-#[derive(Resource, Clone, ExtractResource)]
-struct GameOfLifeImages {
-    texture_a: Handle<Image>,
-    texture_b: Handle<Image>,
-}
-
-#[derive(Resource)]
-struct GameOfLifeBindGroups {
-    // Ping-pong bind groups for the main simulation pass
-    sim_group_a: BindGroup,
-    sim_group_b: BindGroup,
-    // Ping-pong bind groups for the counting pass
-    count_group_a: BindGroup,
-    count_group_b: BindGroup,
-}
-
-#[expect(clippy::needless_pass_by_value)]
-fn prepare_bind_group(
-    mut commands: Commands,
-    pipeline: Res<GameOfLifePipeline>,
-    gpu_images: Res<RenderAssets<GpuImage>>,
-    game_of_life_images: Res<GameOfLifeImages>,
-    render_device: Res<RenderDevice>,
+#[cube(launch)]
+fn update_kernel(
+    input: &Tensor<u32>,
+    output: &mut Tensor<u32>,
+    prev_count_buffer: &Array<Atomic<u32>>,
+    next_count_buffer: &Array<Atomic<u32>>,
 ) {
-    let view_a = gpu_images.get(&game_of_life_images.texture_a).unwrap();
-    let view_b = gpu_images.get(&game_of_life_images.texture_b).unwrap();
-    let count_buffer_binding = pipeline.count_buffer.as_entire_binding();
+    // Place to put the count for the immediate cube.
+    let mut cube_sum = SharedMemory::<Atomic<u32>>::new(1);
+    // Only one needs to initialize it.
+    if UNIT_POS == 0 {
+        Atomic::store(&mut cube_sum[0], 0);
+    }
 
-    let sim_group_a = render_device.create_bind_group(
-        None,
-        &pipeline.texture_bind_group_layout,
-        &BindGroupEntries::sequential((
-            &view_a.texture_view,
-            &view_b.texture_view,
-            count_buffer_binding.clone(),
-        )),
-    );
-    let sim_group_b = render_device.create_bind_group(
-        None,
-        &pipeline.texture_bind_group_layout,
-        &BindGroupEntries::sequential((
-            &view_b.texture_view,
-            &view_a.texture_view,
-            count_buffer_binding.clone(),
-        )),
-    );
-    let count_group_a = render_device.create_bind_group(
-        "count_bind_group_a",
-        &pipeline.count_layout,
-        &BindGroupEntries::sequential((&view_a.texture_view, count_buffer_binding.clone())),
-    );
-    let count_group_b = render_device.create_bind_group(
-        "count_bind_group_b",
-        &pipeline.count_layout,
-        &BindGroupEntries::sequential((&view_b.texture_view, count_buffer_binding)),
-    );
+    sync_cube();
 
-    commands.insert_resource(GameOfLifeBindGroups {
-        sim_group_a,
-        sim_group_b,
-        count_group_a,
-        count_group_b,
+    let x = (CUBE_POS_X * CUBE_DIM_X) + UNIT_POS_X;
+    let y = (CUBE_POS_Y * CUBE_DIM_Y) + UNIT_POS_Y;
+
+    let width = input.shape(1);
+    let height = input.shape(0);
+    let idx = (y * width) + x;
+
+    if x < width && y < height {
+        // Calculate neighbors with simple bounds checks instead of modulo (%)
+        let coord_left = if x == 0 { width - 1 } else { x - 1 };
+        let coord_right = if x == width - 1 { 0u32.into() } else { x + 1 };
+        let coord_above = if y == 0 { height - 1 } else { y - 1 };
+        let coord_below = if y == height - 1 { 0u32.into() } else { y + 1 };
+
+        // Pre-calculate row offsets
+        let row_above_offset = coord_above * width;
+        let row_curr_offset = y * width;
+        let row_below_offset = coord_below * width;
+
+        let neighbors = 
+            // Top row
+            input[row_above_offset + coord_left] + 
+            input[row_above_offset + x] + 
+            input[row_above_offset + coord_right] +
+            // Middle row
+            input[row_curr_offset + coord_left] + 
+            input[row_curr_offset + coord_right] +
+            // Bottom row
+            input[row_below_offset + coord_left] + 
+            input[row_below_offset + x] + 
+            input[row_below_offset + coord_right];
+
+        let current = input[idx];
+        let mut next: u32 = 0;
+
+        // Conway's Rules
+        if current == 1 {
+            if neighbors == 2 || neighbors == 3 {
+                next = 1;
+            }
+        } else {
+            if neighbors == 3 {
+                next = 1;
+            }
+        }
+
+        // Homeostasis
+        let total_pixels = WIDTH * HEIGHT;
+        let alive_count: u32 = Atomic::load(&prev_count_buffer[0]);
+
+        if alive_count < (total_pixels as u32 / 10) {
+            // If current cell is dead...
+            if next != 1 {
+                let seed = ((y as u32) << 16) | (x as u32);
+                // 0.1% chance to spawn
+                if random_float(seed) < 0.001 {
+                    next = 1;
+                }
+            }
+        }
+
+        // Set the pixel to alive or dead.
+        output[idx] = next;
+
+        // Since we're here, let's start the count for the next iteration.
+        if next == 1 {
+            Atomic::add(&cube_sum[0], 1);
+        }
+    }
+
+    sync_cube();
+
+    // Now that everyone's counted their piece, add the cube's count to the global one.
+    // Only one unit needs to do the addition.
+    if UNIT_POS == 0 {
+        let local_count = Atomic::load(&cube_sum[0]);
+        if local_count > 0 {
+            Atomic::add(&next_count_buffer[0], local_count);
+        }
+    }
+}
+
+unsafe fn wrap_tensor<'a>(alloc: &'a Allocation, shape: &'a [usize]) -> TensorArg<'a, WgpuRuntime> {
+    unsafe {
+        TensorArg::<WgpuRuntime>::from_raw_parts::<u32>(&alloc.handle, &alloc.strides, shape, 1)
+    }
+}
+
+unsafe fn wrap_array<'a>(alloc: &'a Allocation) -> ArrayArg<'a, WgpuRuntime> {
+    unsafe { ArrayArg::<WgpuRuntime>::from_raw_parts::<u32>(&alloc.handle, alloc.strides[0], 1) }
+}
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let rec = rerun::RecordingStreamBuilder::new("simslime_cubecl").spawn()?;
+    let client = cubecl::wgpu::WgpuRuntime::client(&Default::default());
+
+    let shape = [HEIGHT, WIDTH];
+
+    println!("Allocating GPU Memory...");
+
+    let tensor_a_alloc = client.create_tensor(&[], &shape, 4);
+    let tensor_b_alloc = client.create_tensor(&[], &shape, 4);
+    let count_alloc_a = client.create_tensor(u32::MAX.to_byte_slice(), &[1], 4);
+    let count_alloc_b = client.create_tensor(bytemuck::bytes_of(&0u32), &[1], 4);
+
+    let cube_size_x = 16;
+    let cube_size_y = 16;
+    // Cube count is rounded up to ensure perfect coverage for any image size.
+    let cube_count_x = (WIDTH + cube_size_x - 1) / cube_size_x;
+    let cube_count_y = (HEIGHT + cube_size_y - 1) / cube_size_y;
+    let cube_dim = CubeDim::new_2d(cube_size_x as u32, cube_size_y as u32);
+    let cube_count = CubeCount::Static(cube_count_x as u32, cube_count_y as u32, 1);
+
+    println!("Launching Init...");
+    init_kernel::launch(&client, cube_count.clone(), cube_dim.clone(), unsafe {
+        wrap_tensor(&tensor_a_alloc, &shape)
     });
-}
 
-#[derive(Resource)]
-struct GameOfLifePipeline {
-    texture_bind_group_layout: BindGroupLayout,
-    count_layout: BindGroupLayout,
-    count_buffer: Buffer,
-    init_pipeline: CachedComputePipelineId,
-    update_pipeline: CachedComputePipelineId,
-    count_pipeline: CachedComputePipelineId,
-}
+    println!("Starting Loop...");
 
-impl FromWorld for GameOfLifePipeline {
-    fn from_world(world: &mut World) -> Self {
-        let render_device = world.resource::<RenderDevice>();
-        let texture_bind_group_layout = render_device.create_bind_group_layout(
-            "GameOfLifeImages",
-            &BindGroupLayoutEntries::sequential(
-                ShaderStages::COMPUTE,
-                (
-                    texture_storage_2d(TextureFormat::R32Float, StorageTextureAccess::ReadOnly),
-                    texture_storage_2d(TextureFormat::R32Float, StorageTextureAccess::WriteOnly),
-                    storage_buffer_read_only::<CountBuffer>(false),
-                ),
-            ),
+    let mut input_is_a = true;
+    for step in 0..10000 {
+        // Ping-Pong Logic
+        let (input, output, prev_count, next_count) = if input_is_a {
+            (
+                &tensor_a_alloc,
+                &tensor_b_alloc,
+                &count_alloc_a,
+                &count_alloc_b,
+            )
+        } else {
+            (
+                &tensor_b_alloc,
+                &tensor_a_alloc,
+                &count_alloc_b,
+                &count_alloc_a,
+            )
+        };
+
+        // Reset counter
+        count_reset_kernel::launch(
+            &client,
+            CubeCount::Static(1, 1, 1),
+            CubeDim::default(),
+            unsafe { wrap_array(&next_count) },
         );
 
-        let count_layout = render_device.create_bind_group_layout(
-            "count_layout",
-            &BindGroupLayoutEntries::sequential(
-                ShaderStages::COMPUTE,
-                (
-                    texture_storage_2d(TextureFormat::R32Float, StorageTextureAccess::ReadOnly),
-                    storage_buffer::<CountBuffer>(false),
-                ),
-            ),
+        // Update state
+        update_kernel::launch(
+            &client,
+            CubeCount::Static(cube_count_x as u32, cube_count_y as u32, 1),
+            CubeDim::new_2d(cube_size_x as u32, cube_size_y as u32),
+            unsafe { wrap_tensor(input, &shape) },
+            unsafe { wrap_tensor(output, &shape) },
+            unsafe { wrap_array(&prev_count) },
+            unsafe { wrap_array(&next_count) },
         );
 
-        let count_buffer = render_device.create_buffer_with_data(&BufferInitDescriptor {
-            label: Some("count_buffer"),
-            contents: &0u32.to_ne_bytes(),
-            usage: BufferUsages::STORAGE | BufferUsages::COPY_DST | BufferUsages::COPY_SRC,
-        });
+        if step % 25 == 0 {
+            let bytes = client.read_one(output.handle.clone());
 
-        let shader = world.load_asset(SHADER_ASSET_PATH);
-        let pipeline_cache = world.resource::<PipelineCache>();
+            // Convert bytes to u32 slice
+            let ints = bytemuck::cast_slice::<u8, u32>(&bytes);
 
-        let init_pipeline = pipeline_cache.queue_compute_pipeline(ComputePipelineDescriptor {
-            label: None,
-            layout: vec![texture_bind_group_layout.clone()],
-            push_constant_ranges: Vec::new(),
-            shader: shader.clone(),
-            shader_defs: vec![],
-            entry_point: Some(Cow::from("init")),
-            zero_initialize_workgroup_memory: false,
-        });
-        let update_pipeline = pipeline_cache.queue_compute_pipeline(ComputePipelineDescriptor {
-            label: None,
-            layout: vec![texture_bind_group_layout.clone()],
-            push_constant_ranges: Vec::new(),
-            shader: shader.clone(),
-            shader_defs: vec![],
-            entry_point: Some(Cow::from("update")),
-            zero_initialize_workgroup_memory: false,
-        });
-        let count_pipeline = pipeline_cache.queue_compute_pipeline(ComputePipelineDescriptor {
-            label: Some("count_pipeline".into()),
-            layout: vec![count_layout.clone()],
-            shader,
-            shader_defs: Vec::new(),
-            entry_point: Some(Cow::from("count_alive_pixels")),
-            push_constant_ranges: Vec::new(),
-            zero_initialize_workgroup_memory: false,
-        });
+            // int (0-1) -> Byte (0-255) for Image
+            let image_buffer: Vec<u8> = ints.iter().map(|&v| (v * 255) as u8).collect();
 
-        GameOfLifePipeline {
-            texture_bind_group_layout,
-            count_layout,
-            count_buffer,
-            init_pipeline,
-            update_pipeline,
-            count_pipeline,
-        }
-    }
-}
+            rec.set_time_sequence("step", step);
+            rec.log(
+                "world/grid",
+                &rerun::Image::from_color_model_and_bytes(
+                    image_buffer,           // Data
+                    [WIDTH as u32, HEIGHT as u32], // Resolution
+                    rerun::ColorModel::L,
+                    rerun::ChannelDatatype::U8,
+                ),
+            )
+            .unwrap();
 
-enum GameOfLifeState {
-    Loading,
-    Init,
-    Update(usize),
-}
+            let count_bytes = client.read_one(next_count.handle.clone());
+            let count_val = bytemuck::cast_slice::<u8, u32>(&count_bytes)[0];
 
-struct GameOfLifeNode {
-    state: GameOfLifeState,
-}
-
-impl Default for GameOfLifeNode {
-    fn default() -> Self {
-        Self {
-            state: GameOfLifeState::Loading,
-        }
-    }
-}
-
-impl render_graph::Node for GameOfLifeNode {
-    fn update(&mut self, world: &mut World) {
-        let pipeline = world.resource::<GameOfLifePipeline>();
-        let pipeline_cache = world.resource::<PipelineCache>();
-
-        // if the corresponding pipeline has loaded, transition to the next stage
-        match self.state {
-            GameOfLifeState::Loading => {
-                match pipeline_cache.get_compute_pipeline_state(pipeline.init_pipeline) {
-                    CachedPipelineState::Ok(_) => {
-                        self.state = GameOfLifeState::Init;
-                    }
-                    CachedPipelineState::Err(err) => {
-                        panic!("Initializing assets/{SHADER_ASSET_PATH}:\n{err}")
-                    }
-                    _ => {}
-                }
-            }
-            GameOfLifeState::Init => {
-                if let (CachedPipelineState::Ok(_), CachedPipelineState::Ok(_)) = (
-                    pipeline_cache.get_compute_pipeline_state(pipeline.update_pipeline),
-                    pipeline_cache.get_compute_pipeline_state(pipeline.count_pipeline),
-                ) {
-                    self.state = GameOfLifeState::Update(1);
-                }
-            }
-            GameOfLifeState::Update(0) => {
-                self.state = GameOfLifeState::Update(1);
-            }
-            GameOfLifeState::Update(1) => {
-                self.state = GameOfLifeState::Update(0);
-            }
-            GameOfLifeState::Update(_) => unreachable!(),
-        }
-    }
-
-    fn run(
-        &self,
-        _graph: &mut render_graph::RenderGraphContext,
-        render_context: &mut RenderContext,
-        world: &World,
-    ) -> Result<(), render_graph::NodeRunError> {
-        let bind_groups = &world.resource::<GameOfLifeBindGroups>();
-        let pipeline_cache = world.resource::<PipelineCache>();
-        let pipeline = world.resource::<GameOfLifePipeline>();
-
-        let command_encoder = render_context.command_encoder();
-
-        // select the pipeline based on the current state
-        match self.state {
-            GameOfLifeState::Loading => {}
-            GameOfLifeState::Init => {
-                let mut pass =
-                    command_encoder.begin_compute_pass(&ComputePassDescriptor::default());
-                let init_pipeline = pipeline_cache
-                    .get_compute_pipeline(pipeline.init_pipeline)
-                    .unwrap();
-                pass.set_bind_group(0, &bind_groups.sim_group_a, &[]);
-                pass.set_pipeline(init_pipeline);
-                pass.dispatch_workgroups(SIZE.0 / WORKGROUP_SIZE, SIZE.1 / WORKGROUP_SIZE, 1);
-            }
-            GameOfLifeState::Update(index) => {
-                let (sim_bind_group, count_bind_group) = if index == 0 {
-                    (&bind_groups.sim_group_a, &bind_groups.count_group_a)
-                } else {
-                    (&bind_groups.sim_group_b, &bind_groups.count_group_b)
-                };
-
-                let count_pipeline = pipeline_cache
-                    .get_compute_pipeline(pipeline.count_pipeline)
-                    .unwrap();
-                let update_pipeline = pipeline_cache
-                    .get_compute_pipeline(pipeline.update_pipeline)
-                    .unwrap();
-
-                command_encoder.clear_buffer(&pipeline.count_buffer, 0, None);
-                {
-                    let mut pass =
-                        command_encoder.begin_compute_pass(&ComputePassDescriptor::default());
-                    pass.set_pipeline(count_pipeline);
-                    pass.set_bind_group(0, count_bind_group, &[]);
-                    pass.dispatch_workgroups(SIZE.0 / WORKGROUP_SIZE, SIZE.1 / WORKGROUP_SIZE, 1);
-                }
-
-                {
-                    let mut pass =
-                        command_encoder.begin_compute_pass(&ComputePassDescriptor::default());
-                    pass.set_bind_group(0, sim_bind_group, &[]);
-                    pass.set_pipeline(update_pipeline);
-                    pass.dispatch_workgroups(SIZE.0 / WORKGROUP_SIZE, SIZE.1 / WORKGROUP_SIZE, 1);
-                }
-            }
+            // Log the population graph
+            rec.log("world/stats/population", &rerun::Scalars::new([count_val]))
+                .unwrap();
         }
 
-        Ok(())
+        // Swap and repeat
+        input_is_a = !input_is_a;
     }
+
+    Ok(())
 }
